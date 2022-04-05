@@ -6,14 +6,35 @@ from PSCalib.GeometryAccess import GeometryAccess
 
 class PsanaInterface:
 
-    def __init__(self, exp, run, det_type, track_timestamps=False):
-        self.exp = exp # experiment name, string
+    def __init__(self, exp, run, det_type, mpi_mode=True, ffb_mode=False, track_timestamps=False):
+        self.exp = exp # experiment name, str
         self.run = run # run number, int
-        self.det_type = det_type # detector name, string
+        self.det_type = det_type # detector name, str
         self.track_timestamps = track_timestamps # bool, keep event info
+        self.mpi_mode = mpi_mode # bool, if True use MPIDataSource
         self.seconds, self.nanoseconds, self.fiducials = [], [], []
-        self.ds = psana.DataSource(f'exp={exp}:run={run}')
+        self.set_up(mpi_mode, ffb_mode)
         self.det = psana.Detector(det_type, self.ds.env())
+        
+    def set_up(self, mpi_mode, ffb_mode):
+        """
+        Instantiate (MPI)DataSource object.
+        
+        Parameters
+        ----------
+        mpi_mode : bool
+            if True, use MPIDataSource for parallelization
+        ffb_mode : bool
+            if True, set up in an FFB-compatible style
+        """
+        ds_args=f'exp={self.exp}:run={self.run}'
+        if ffb_mode:
+            ds_args += f':dir=/cds/data/drpsrcf/{self.exp[:3]}/{self.exp}/xtc'
+        
+        if mpi_mode:
+            self.ds = psana.MPIDataSource(ds_args)
+        else:
+            self.ds = psana.DataSource(ds_args)
         
     def get_pixel_size(self):
         """
@@ -68,12 +89,17 @@ class PsanaInterface:
         """
         Retrieve a fixed number of images from the run. If the pedestal or gain 
         information is unavailable and unassembled images are requested, return
-        uncalibrated images.
+        uncalibrated images. If using MPIDataSource, the retrieved images will 
+        be returned distributed across the available ranks. To stitch them back
+        into the proper order, one can use the timestamps after sorting them.
         
-        Paramters
+        NB: When calling this function repeatedly, an event is skipped between
+        each call. Something to be fixed at a later date...
+
+        Parameters
         ---------
         num_images : int
-            number of images to retrieve
+            number of images to retrieve (per rank)
         assemble : bool, default=True
             whether to assemble panels into image
             
@@ -84,16 +110,23 @@ class PsanaInterface:
         """
         counter = 0
         calibrate = True
+        
+        if self.mpi_mode:
+            num_images_rank = num_images // self.ds.size 
+            if self.ds.rank < (num_images % self.ds.size):
+                num_images_rank += 1
+        else:
+            num_images_rank = num_images
 
         if assemble:
-            images = np.zeros((num_images, 
+            images = np.zeros((num_images_rank, 
                                self.det.image_xaxis(self.run).shape[0], 
                                self.det.image_yaxis(self.run).shape[0]))
         else:
-            images = np.zeros((num_images,) + self.det.shape())
+            images = np.zeros((num_images_rank,) + self.det.shape())
         
         for num,evt in enumerate(self.ds.events()):
-            if counter < num_images:
+            if counter < num_images_rank:
                 # check that pedestal and gain information are available
                 if counter == 0:
                     if (self.det.pedestals(evt) is None) or (self.det.gain(evt) is None):
@@ -126,7 +159,6 @@ class PsanaInterface:
             images = images[:counter]
             
         return images
-
 
 #### Miscellaneous functions ####
 
