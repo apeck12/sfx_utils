@@ -33,8 +33,8 @@ class PsanaInterface:
         
         self.ds = psana.DataSource(ds_args)   
         self.det = psana.Detector(det_type, self.ds.env())
-        self.run = next(self.ds.runs())
-        self.times = self.run.times()
+        self.runner = next(self.ds.runs())
+        self.times = self.runner.times()
         self.max_events = len(self.times)
         self._calib_data_available()
         
@@ -43,7 +43,7 @@ class PsanaInterface:
         Check whether calibration data is available.
         """
         self.calibrate = True
-        evt = self.run.event(self.times[0])
+        evt = self.runner.event(self.times[0])
         if (self.det.pedestals(evt) is None) or (self.det.gain(evt) is None):
             print("Warning: calibration data unavailable, returning uncalibrated data")
             self.calibrate = False
@@ -168,7 +168,7 @@ class PsanaInterface:
                 break
                 
             else:
-                evt = self.run.event(self.times[self.counter])
+                evt = self.runner.event(self.times[self.counter])
                 if assemble:
                     if not self.calibrate:
                         raise IOError("Error: calibration data not found for this run.")
