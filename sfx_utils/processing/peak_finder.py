@@ -35,11 +35,31 @@ class PeakFinder:
         self.max_peaks = max_peaks # int, max number of peaks per image
         
         # set up 
-        self.psi = PsanaInterface(exp=exp, run=run, det_type=det_type, track_timestamps=True)
+        self.set_up_psana_interface(exp, run, det_type)
+        self.set_up_cxi(outdir, tag)
+        self.set_up_algorithm(mask_file=mask, psana_mask=psana_mask)
+        
+    def set_up_psana_interface(self, exp, run, det_type):
+        """
+        Set up PsanaInterface object and distribute events between ranks.
+        
+        Parameters
+        ----------
+        exp : str
+            experiment name
+        run : int
+            run number
+        det_type : str
+            detector name, e.g. jungfrau4M or epix10k2M
+        """
+        self.psi = PsanaInterface(exp=exp, run=run, det_type=det_type)
         self.psi.distribute_events(self.rank, self.size)
         self.n_events = self.psi.max_events
-        self.set_up_cxi(outdir, tag)
-        self.set_up_algorithm(mask_file=mask, psana_mask=psana_mask)  
+
+        # additional self variables for tracking peak stats
+        self.iX = self.psi.det.indexes_x(self.psi.run).astype(np.int64)
+        self.iY = self.psi.det.indexes_y(self.psi.run).astype(np.int64)
+        self.ipx, self.ipy = self.psi.det.point_indexes(self.psi.run, pxy_um=(0, 0))
         
     def _generate_mask(self, mask_file=None, psana_mask=True):
         """
@@ -78,11 +98,6 @@ class PeakFinder:
                                          son_min=self.son_min)
         self.n_hits = 0
         self.powder_hits, self.powder_misses = None, None
-        
-        # additional self variables for tracking peak stats
-        self.iX = self.psi.det.indexes_x(self.psi.run).astype(np.int64)
-        self.iY = self.psi.det.indexes_y(self.psi.run).astype(np.int64)
-        self.ipx, self.ipy = self.psi.det.point_indexes(self.psi.run, pxy_um=(0, 0))
 
     def set_up_cxi(self, outdir, tag=''):
         """
@@ -116,7 +131,7 @@ class PeakFinder:
         data_1.attrs["axes"] = "experiment_identifier"
         
         for key in ['powderHits', 'powderMisses']:
-            entry_1.create_dataset(key, (dim0, dim1), chunks=(dim0, dim1), maxshape=(dim0, dim1), dtype=float)
+            entry_1.create_dataset(f'/entry_1/data_1/{key}', (dim0, dim1), chunks=(dim0, dim1), maxshape=(dim0, dim1), dtype=float)
                 
         # peak-related keys
         for key in keys:
@@ -183,25 +198,29 @@ class PeakFinder:
         
     def curate_cxi(self):
         """
-        Curate the CXI file by reshaping the keys and adding powders.
+        Curate the CXI file by reshaping the keys to the number of hits
+        and adding powders.
         """
         outh5 = h5py.File(self.fname,"r+")
-        
-        # add powders
-        outh5["/entry_1/data_1/powderHits"][:] = self.powder_hits.reshape(-1, self.powder_hits.shape[-1])
-        outh5["/entry_1/data_1/powderMisses"][:] = self.powder_misses.reshape(-1, self.powder_misses.shape[-1])       
         
         # resize the CrystFEL keys
         data_shape = outh5["/entry_1/data_1/data"].shape
         outh5['/entry_1/data_1/data'].resize((self.n_hits, data_shape[1], data_shape[2]))
+        outh5[f'/entry_1/result_1/nPeaks'].resize((self.n_hits,))
 
-        for key in ['peakXPosRaw', 'peakYPosRaw', 'rcent', 'ccent', 'rmin',
-                    'rmax', 'cmin', 'cmax' 'peakTotalIntensity', 'peakMaxIntensity', 'peakRadius']:
-            outh5[f'/entry_1/result_1/{key}'].resize(self.n_hits, self.max_peaks)
+        for key in ['peakXPosRaw', 'peakYPosRaw', 'rcent', 'ccent', 'rmin', 'rmax', 
+                    'cmin', 'cmax', 'peakTotalIntensity', 'peakMaxIntensity', 'peakRadius']:
+            outh5[f'/entry_1/result_1/{key}'].resize((self.n_hits, self.max_peaks))
             
         # crop the LCLS keys
         for key in ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial']:
-            outh5[f'/LCLS.{key}'].resize((self.n_events,))
+            outh5[f'/LCLS/{key}'].resize((self.n_hits,))
+
+        # add powders
+        if self.powder_hits is not None:
+            outh5["/entry_1/data_1/powderHits"][:] = self.powder_hits.reshape(-1, self.powder_hits.shape[-1])
+        if self.powder_misses is not None:
+            outh5["/entry_1/data_1/powderMisses"][:] = self.powder_misses.reshape(-1, self.powder_misses.shape[-1])
             
         outh5.close()
     
@@ -264,7 +283,6 @@ class PeakFinder:
             if (peaks.shape[0] >= self.min_peaks) and (peaks.shape[0] <= self.max_peaks):
                 self.store_event(outh5, img, peaks)
                 self.n_hits+=1
-                print(idx, peaks.shape[0], self.psi.fiducials[-1])
                 
             # generate / update powders
             if peaks.shape[0] >= self.min_peaks:
@@ -318,3 +336,4 @@ if __name__ == '__main__':
                     npix_min=params.npix_min, npix_max=params.npix_max, amax_thr=params.amax_thr, atot_thr=params.atot_thr, 
                     son_min=params.son_min, peak_rank=params.peak_rank, r0=params.r0, dr=params.dr, nsigm=params.nsigm)
     pf.find_peaks()
+    pf.curate_cxi()
