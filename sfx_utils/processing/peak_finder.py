@@ -130,7 +130,7 @@ class PeakFinder:
                                         maxshape=(None, dim0, dim1),dtype=np.float32)
         data_1.attrs["axes"] = "experiment_identifier"
         
-        for key in ['powderHits', 'powderMisses']:
+        for key in ['powderHits', 'powderMisses', 'mask']:
             entry_1.create_dataset(f'/entry_1/data_1/{key}', (dim0, dim1), chunks=(dim0, dim1), maxshape=(dim0, dim1), dtype=float)
                 
         # peak-related keys
@@ -216,12 +216,13 @@ class PeakFinder:
         for key in ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial']:
             outh5[f'/LCLS/{key}'].resize((self.n_hits,))
 
-        # add powders
+        # add powders and mask, reshaping to match crystfel conventions
         if self.powder_hits is not None:
             outh5["/entry_1/data_1/powderHits"][:] = self.powder_hits.reshape(-1, self.powder_hits.shape[-1])
         if self.powder_misses is not None:
             outh5["/entry_1/data_1/powderMisses"][:] = self.powder_misses.reshape(-1, self.powder_misses.shape[-1])
-            
+        outh5["/entry_1/data_1/mask"][:] = (1-self.mask).reshape(-1, self.mask.shape[-1]) # psocake inverts values 
+
         outh5.close()
     
     def _compute_peak_radius(self, peaks):
