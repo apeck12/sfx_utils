@@ -76,6 +76,25 @@ class PsanaInterface:
         """
         return self.ds.env().epicsStore().value('SIOC:SYS0:ML00:AO192') * 10.
     
+    def get_wavelength_evt(self, evt):
+        """
+        Retrieve the detector's wavelength for a specfic event.
+
+        Parameters
+        ----------
+        evt : psana.Event object
+            individual psana event
+        
+        Returns
+        -------
+        wavelength : float
+            wavelength in Angstrom
+        """
+        ebeam = psana.Detector('EBeam')
+        photon_energy = ebeam.get(evt).ebeamPhotonEnergy()
+        lambda_m =  1.23984197386209e-06 / photon_energy # convert to meters using e=hc/lambda
+        return lambda_m * 1e10
+
     def estimate_distance(self):
         """
         Retrieve an estimate of the detector distance in mm.
