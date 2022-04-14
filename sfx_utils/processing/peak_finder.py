@@ -2,6 +2,7 @@ import numpy as np
 import argparse
 import h5py
 import os
+from mpi4py import MPI
 from sfx_utils.interfaces.psana_interface import *
 from psalgos.pypsalgos import PyAlgos
 
@@ -12,14 +13,13 @@ class PeakFinder:
     format. Adapted from psocake.
     """
     
-    def __init__(self, exp, run, det_type, outdir, tag='', mask=None, psana_mask=True, 
+    def __init__(self, exp, run, det_type, outdir, tag='', mask=None, psana_mask=True, dist=None,
                  min_peaks=2, max_peaks=2048, npix_min=2, npix_max=30, amax_thr=80., 
                  atot_thr=120.,  son_min=7.0, peak_rank=3, r0=3.0, dr=2.0, nsigm=7.0):
         
-        from mpi4py import MPI
-        comm = MPI.COMM_WORLD
-        self.rank = comm.Get_rank()
-        self.size = comm.Get_size()
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size()
         
         # peak-finding algorithm parameters
         self.npix_min = npix_min # int, min number of pixels in peak
@@ -33,10 +33,12 @@ class PeakFinder:
         self.nsigm = nsigm # intensity threshold to include pixel in connected group, float
         self.min_peaks = min_peaks # int, min number of peaks per image
         self.max_peaks = max_peaks # int, max number of peaks per image
-        
-        # set up 
+        self.dist = dist # float, distance to detector in mm, or str for a pv code
+        self.outdir = outdir # str, path for saving cxi files
+
+        # set up class
         self.set_up_psana_interface(exp, run, det_type)
-        self.set_up_cxi(outdir, tag)
+        self.set_up_cxi(tag)
         self.set_up_algorithm(mask_file=mask, psana_mask=psana_mask)
         
     def set_up_psana_interface(self, exp, run, det_type):
@@ -60,7 +62,19 @@ class PeakFinder:
         self.iX = self.psi.det.indexes_x(self.psi.run).astype(np.int64)
         self.iY = self.psi.det.indexes_y(self.psi.run).astype(np.int64)
         self.ipx, self.ipy = self.psi.det.point_indexes(self.psi.run, pxy_um=(0, 0))
-        
+
+        # retrieve psana-estimated distance if None or a PV code is supplied
+        if type(self.dist) != float:
+            if self.psi.det_type == 'jungfrau4M':
+                pv = 'CXI:DS1:MMS:06.RBV'
+            if self.psi.det_type == 'Rayonix':
+                pv = 'MFX:DET:MMS:04.RBV'
+            if self.psi.det_type == 'epix10k2M':
+                pv = 'MFX:ROB:CONT:POS:Z'
+            if type(self.dist) == str: # override default detector / PV
+                pv = self.dist
+            self.dist = self.psi.ds.env().epicsStore().value(pv)
+
     def _generate_mask(self, mask_file=None, psana_mask=True):
         """
         Generate mask, optionally a combination of the psana-generated mask
@@ -99,20 +113,19 @@ class PeakFinder:
         self.n_hits = 0
         self.powder_hits, self.powder_misses = None, None
 
-    def set_up_cxi(self, outdir, tag=''):
+    def set_up_cxi(self, tag=''):
         """
         Set up the CXI files to which peak finding results will be saved.
         
         Parameters
         ----------
-        outdir : str
-            output directory
         tag : str
             file nomenclature suffix, optional
         """
         if (tag != '') and (tag[0]!='_'):
             tag = '_' + tag
-        self.fname = os.path.join(outdir, f'{self.psi.exp}_{self.psi.run:04}_{self.rank}{tag}.cxi')
+        self.tag = tag # track for writing summary file
+        self.fname = os.path.join(self.outdir, f'{self.psi.exp}_{self.psi.run:04}_{self.rank}{tag}.cxi')
         
         outh5 = h5py.File(self.fname, 'w')
         
@@ -146,15 +159,20 @@ class PeakFinder:
             
         # LCLS dataset to track event timestamps
         lcls_1 = outh5.create_group("LCLS")
-        keys = ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial']
-        
+        keys = ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial', 'photon_energy_eV']
         for key in keys:
-            ds_x = lcls_1.create_dataset(f'{key}', (self.n_events,), maxshape=(None,), dtype=int)
+            if key == 'photon_energy_eV':
+                ds_x = lcls_1.create_dataset(f'{key}', (self.n_events,), maxshape=(None,), dtype=float)
+            else:
+                ds_x = lcls_1.create_dataset(f'{key}', (self.n_events,), maxshape=(None,), dtype=int)
             ds_x.attrs["axes"] = "experiment_identifier"
+
+        ds_x = outh5.create_dataset('/LCLS/detector_1/EncoderValue', (self.n_events,), maxshape=(None,), dtype=float)
+        ds_x.attrs["axes"] = "experiment_identifier"
             
         outh5.close()
     
-    def store_event(self, outh5, img, peaks):
+    def store_event(self, outh5, img, peaks, phot_energy):
         """
         Store event's peaks in CXI file, converting to Cheetah conventions.
         
@@ -166,6 +184,8 @@ class PeakFinder:
             calibrated detector data in shape of unassembled detector
         peaks : numpy.ndarray, shape (n_peaks, 17)
             results of peak finding algorithm for a single event
+        phot_energy : float
+            photon energy in eV
         """
         if self.psi.det_type not in ['jungfrau4M', 'epix10k2M']:
             print("Warning! Reformatting to Cheetah may not be correct")
@@ -195,7 +215,8 @@ class PeakFinder:
         outh5['/LCLS/machineTime'][self.n_hits] = self.psi.seconds[-1]
         outh5['/LCLS/machineTimeNanoSeconds'][self.n_hits] = self.psi.nanoseconds[-1]
         outh5['/LCLS/fiducial'][self.n_hits] = self.psi.fiducials[-1]
-        
+        outh5['/LCLS/photon_energy_eV'][self.n_hits] = phot_energy
+
     def curate_cxi(self):
         """
         Curate the CXI file by reshaping the keys to the number of hits
@@ -212,7 +233,8 @@ class PeakFinder:
                     'cmin', 'cmax', 'peakTotalIntensity', 'peakMaxIntensity', 'peakRadius']:
             outh5[f'/entry_1/result_1/{key}'].resize((self.n_hits, self.max_peaks))
             
-        # crop the LCLS keys
+        # add distance, then crop the LCLS keys
+        outh5['/LCLS/detector_1/EncoderValue'][:] = self.dist
         for key in ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial']:
             outh5[f'/LCLS/{key}'].resize((self.n_hits,))
 
@@ -272,17 +294,26 @@ class PeakFinder:
         
         start_idx, end_idx = self.psi.counter, self.psi.max_events
         outh5 = h5py.File(self.fname,"r+")
+        empty_images = 0
 
         for idx in range(start_idx, end_idx):
             # retrieve calibrated image
             evt = self.psi.runner.event(self.psi.times[self.psi.counter])
             self.psi.get_timestamp(evt.get(EventId))
             img = self.psi.det.calib(evt=evt)
-            
+            if img is None:
+                empty_images += 1
+                continue
+
             # search for peaks and store if found
             peaks = self.find_peaks_event(img)
             if (peaks.shape[0] >= self.min_peaks) and (peaks.shape[0] <= self.max_peaks):
-                self.store_event(outh5, img, peaks)
+                try:
+                    phot_energy = 1.23984197386209e-06 / (self.psi.get_wavelength_evt(evt) / 10 / 1.0e9)
+                except AttributeError:
+                    print(f"AttributeError, evt type: {type(evt)} for event {evt}")
+                    phot_energy = 1.23984197386209e-06 / (self.psi.get_wavelength() / 10 / 1.0e9)
+                self.store_event(outh5, img, peaks, phot_energy)
                 self.n_hits+=1
                 
             # generate / update powders
@@ -300,6 +331,24 @@ class PeakFinder:
             self.psi.counter+=1
             
         outh5.close()
+        self.comm.Barrier()
+
+        if empty_images != 0:
+            print(f"Rank {self.rank} encountered {empty_images} empty images.")
+
+    def summarize(self):
+        """
+        Summarize results and generate the input file for indexamajig.
+        """
+        n_hits_total = self.comm.reduce(self.n_hits, MPI.SUM)
+        n_events_total = self.comm.reduce(self.n_events, MPI.SUM)
+        if self.rank == 0:
+            with open(os.path.join(self.outdir, f'peakfinding{self.tag}.summary'), 'w') as f:
+                f.write(f"Number of events processed: {n_events_total}\n")
+                f.write(f"Number of hits found: {n_hits_total}\n")
+                f.write(f"Hit rate (%): {n_hits_total/n_events_total:.2f}\n")
+
+        return
                         
 #### For command line use ####
             
@@ -338,3 +387,4 @@ if __name__ == '__main__':
                     son_min=params.son_min, peak_rank=params.peak_rank, r0=params.r0, dr=params.dr, nsigm=params.nsigm)
     pf.find_peaks()
     pf.curate_cxi()
+    pf.summarize()
