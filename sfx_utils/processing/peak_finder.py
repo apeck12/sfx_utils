@@ -235,7 +235,7 @@ class PeakFinder:
             
         # add distance, then crop the LCLS keys
         outh5['/LCLS/detector_1/EncoderValue'][:] = self.dist
-        for key in ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial']:
+        for key in ['eventNumber', 'machineTime', 'machineTimeNanoSeconds', 'fiducial', 'detector_1/EncoderValue', 'photon_energy_eV']:
             outh5[f'/LCLS/{key}'].resize((self.n_hits,))
 
         # add powders and mask, reshaping to match crystfel conventions
