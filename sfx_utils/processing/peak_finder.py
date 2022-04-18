@@ -20,6 +20,8 @@ class PeakFinder:
         self.comm = MPI.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
+        self.n_hits_per_rank = []
+        self.n_hits_total = 0
         
         # peak-finding algorithm parameters
         self.npix_min = npix_min # int, min number of pixels in peak
@@ -243,7 +245,7 @@ class PeakFinder:
             outh5["/entry_1/data_1/powderHits"][:] = self.powder_hits.reshape(-1, self.powder_hits.shape[-1])
         if self.powder_misses is not None:
             outh5["/entry_1/data_1/powderMisses"][:] = self.powder_misses.reshape(-1, self.powder_misses.shape[-1])
-        outh5["/entry_1/data_1/mask"][:] = (1-self.mask).reshape(-1, self.mask.shape[-1]) # psocake inverts values 
+        outh5["/entry_1/data_1/mask"][:] = (1-self.mask).reshape(-1, self.mask.shape[-1]) # crystfel expects inverted values
 
         outh5.close()
     
@@ -338,18 +340,108 @@ class PeakFinder:
 
     def summarize(self):
         """
-        Summarize results and generate the input file for indexamajig.
+        Summarize results and write to peakfinding.summary file.
         """
-        n_hits_total = self.comm.reduce(self.n_hits, MPI.SUM)
+        # grab summary stats
+        self.n_hits_per_rank = self.comm.gather(self.n_hits, root=0)
+        self.n_hits_total = self.comm.reduce(self.n_hits, MPI.SUM)
         n_events_total = self.comm.reduce(self.n_events, MPI.SUM)
+        
         if self.rank == 0:
+            # write summary file
             with open(os.path.join(self.outdir, f'peakfinding{self.tag}.summary'), 'w') as f:
                 f.write(f"Number of events processed: {n_events_total}\n")
-                f.write(f"Number of hits found: {n_hits_total}\n")
-                f.write(f"Hit rate (%): {n_hits_total/n_events_total:.2f}\n")
+                f.write(f"Number of hits found: {self.n_hits_total}\n")
+                f.write(f"Hit rate (%): {self.n_hits_total/n_events_total:.2f}\n")
+                f.write(f'No. hits per rank: {self.n_hits_per_rank}')
 
-        return
-                        
+            # generate virtual dataset and list for
+            vfname = os.path.join(self.outdir, f'{self.psi.exp}_{self.psi.run:04}{self.tag}.cxi')
+            self.generate_vds(vfname)
+            with open(os.path.join(self.outdir, f'r{self.psi.run:04}{self.tag}.lst'), 'w') as f:
+                f.write(f"{vfname}\n")
+        
+    def add_virtual_dataset(self, vfname, fnames, dname, shape, dtype, mode='a'):
+        """
+        Add a virtual dataset to the hdf5 file.
+
+        Parameters
+        ----------
+        vfname : str
+            filename for virtual CXI file
+        fnames : list of str
+            list of individual CXI file names
+        dname : str
+            dataset path within hdf5 file
+        shape : tuple
+            shape of virtual dataset
+        dtype : type
+            dataset type, e.g. int or float
+        mode : str
+            'w' if first dataset, 'a' otherwise
+        """
+        layout = h5py.VirtualLayout(shape=(self.n_hits_total,) + shape[1:], dtype=dtype)
+        cursor = 0
+        for i,fn in enumerate(fnames):
+            vsrc = h5py.VirtualSource(fn, dname, shape=(self.n_hits_per_rank[i],) + shape[1:])
+            if len(shape) == 1:
+                layout[cursor : cursor + self.n_hits_per_rank[i]] = vsrc
+            else:
+                layout[cursor : cursor + self.n_hits_per_rank[i], :] = vsrc
+            cursor += self.n_hits_per_rank[i]
+        with h5py.File(vfname, mode, libver="latest") as f:
+            f.create_virtual_dataset(dname, layout, fillvalue=-1)
+
+    def generate_vds(self, vfname):
+        """
+        Generate a virtual dataset to map all individual files for this run.
+
+        Parameters
+        ----------
+        vfname : str
+            filename for virtual CXI file    
+        """
+        if not hasattr(h5py, 'VirtualLayout'):
+            raise Exception("HDF5>=1.10 and h5py>=2.9 are required to generate a virtual dataset")
+            
+        # retrieve list of file names
+        fnames = []
+        for fi in range(self.size):
+            if self.n_hits_per_rank[fi] > 0:
+                fnames.append(os.path.join(self.outdir, f'{self.psi.exp}_{self.psi.run:04}_{fi}{self.tag}.cxi'))
+        if len(fnames) == 0:
+            sys.exit("No hits found")
+        print(f"Files with peaks: {fnames}")
+
+        # retrieve datasets to populate in virtual hdf5
+        dname_list, key_list, shape_list, dtype_list = [], [], [], []
+        datasets = ['/entry_1/result_1', '/LCLS/detector_1', '/LCLS', '/entry_1/data_1']
+        f = h5py.File(self.fname, "r")
+        for dname in datasets:
+            dset = f[dname]
+            for key in dset.keys():
+                if f'{dname}/{key}' not in datasets:
+                    dname_list.append(dname)
+                    key_list.append(key)
+                    shape_list.append(dset[key].shape)
+                    dtype_list.append(dset[key].dtype)
+        f.close()    
+
+        # populate virtual dataset
+        for dnum in range(len(dname_list)):
+            mode = 'a'
+            if dnum == 0: 
+                mode = 'w'
+            dname = f'{dname_list[dnum]}/{key_list[dnum]}'
+            if key_list[dnum] not in ['mask', 'powderHits', 'powderMisses']:
+                self.add_virtual_dataset(vfname, fnames, dname, shape_list[dnum], dtype_list[dnum], mode=mode)
+            if key_list[dnum] == 'mask':
+                layout = h5py.VirtualLayout(shape=shape_list[dnum], dtype=dtype_list[dnum])
+                vsrc = h5py.VirtualSource(fnames[0], dname, shape=shape_list[dnum])
+                layout[:] = vsrc
+                with h5py.File(vfname, "a", libver="latest") as f:
+                     f.create_virtual_dataset(dname, layout, fillvalue=-1)
+
 #### For command line use ####
             
 def parse_input():
