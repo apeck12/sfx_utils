@@ -477,6 +477,7 @@ if __name__ == '__main__':
                     mask=params.mask, psana_mask=params.psana_mask, min_peaks=params.min_peaks, max_peaks=params.max_peaks,
                     npix_min=params.npix_min, npix_max=params.npix_max, amax_thr=params.amax_thr, atot_thr=params.atot_thr, 
                     son_min=params.son_min, peak_rank=params.peak_rank, r0=params.r0, dr=params.dr, nsigm=params.nsigm)
+    print(f"Num ranks: {pf.size}")
     pf.find_peaks()
     pf.curate_cxi()
     pf.summarize()
