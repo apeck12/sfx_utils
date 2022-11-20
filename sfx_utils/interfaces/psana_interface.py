@@ -6,14 +6,53 @@ from PSCalib.GeometryAccess import GeometryAccess
 
 class PsanaInterface:
 
-    def __init__(self, exp, run, det_type, track_timestamps=False):
-        self.exp = exp # experiment name, string
+    def __init__(self, exp, run, det_type, ffb_mode=False, track_timestamps=False):
+        self.exp = exp # experiment name, str
         self.run = run # run number, int
-        self.det_type = det_type # detector name, string
+        self.det_type = det_type # detector name, str
         self.track_timestamps = track_timestamps # bool, keep event info
         self.seconds, self.nanoseconds, self.fiducials = [], [], []
-        self.ds = psana.DataSource(f'exp={exp}:run={run}')
+        self.set_up(det_type, ffb_mode)
+        self.counter = 0 
+
+    def set_up(self, det_type, ffb_mode):
+        """
+        Instantiate DataSource and Detector objects; use the run 
+        functionality to retrieve all psana.EventTimes.
+        
+        Parameters
+        ----------
+        det_type : str
+            detector type, e.g. epix10k2M or jungfrau4M
+        ffb_mode : bool
+            if True, set up in an FFB-compatible style
+        """
+        ds_args=f'exp={self.exp}:run={self.run}:idx'
+        if ffb_mode:
+            ds_args += f':dir=/cds/data/drpsrcf/{self.exp[:3]}/{self.exp}/xtc'
+        
+        self.ds = psana.DataSource(ds_args)   
         self.det = psana.Detector(det_type, self.ds.env())
+        self.runner = next(self.ds.runs())
+        self.times = self.runner.times()
+        self.max_events = len(self.times)
+        self._calib_data_available()
+        
+    def _calib_data_available(self):
+        """
+        Check whether calibration data is available.
+        """
+        self.calibrate = True
+        evt = self.runner.event(self.times[0])
+        if (self.det.pedestals(evt) is None) or (self.det.gain(evt) is None):
+            print("Warning: calibration data unavailable, returning uncalibrated data")
+            self.calibrate = False
+            
+    def turn_calibration_off(self):
+        """
+        Do not apply calibration to images.
+        """
+        self.calibrate = False
         
     def get_pixel_size(self):
         """
@@ -37,6 +76,25 @@ class PsanaInterface:
         """
         return self.ds.env().epicsStore().value('SIOC:SYS0:ML00:AO192') * 10.
     
+    def get_wavelength_evt(self, evt):
+        """
+        Retrieve the detector's wavelength for a specfic event.
+
+        Parameters
+        ----------
+        evt : psana.Event object
+            individual psana event
+        
+        Returns
+        -------
+        wavelength : float
+            wavelength in Angstrom
+        """
+        ebeam = psana.Detector('EBeam')
+        photon_energy = ebeam.get(evt).ebeamPhotonEnergy()
+        lambda_m =  1.23984197386209e-06 / photon_energy # convert to meters using e=hc/lambda
+        return lambda_m * 1e10
+
     def estimate_distance(self):
         """
         Retrieve an estimate of the detector distance in mm.
@@ -63,17 +121,48 @@ class PsanaInterface:
         self.nanoseconds.append(evtId.time()[1])
         self.fiducials.append(evtId.fiducials())
         return
-    
+
+    def distribute_events(self, rank, total_ranks, max_events=-1):
+        """
+        For parallel processing. Update self.counter and self.max_events such that
+        events will be distributed evenly across total_ranks, and each rank will 
+        only process its assigned events. Hack to avoid explicitly using MPI here.
+        
+        Parameters
+        ----------
+        rank : int
+            current rank
+        total_ranks : int
+            total number of ranks
+        max_events : int, optional
+            total number of images desired, option to override self.max_events 
+        """
+        if max_events == -1:
+            max_events = self.max_events
+            
+        # determine boundary indices between ranks
+        split_indices = np.zeros(total_ranks)
+        for r in range(total_ranks):
+            num_per_rank = max_events // total_ranks
+            if r < (max_events % total_ranks):
+                num_per_rank += 1
+            split_indices[r] = num_per_rank
+        split_indices = np.append(np.array([0]), np.cumsum(split_indices)).astype(int)   
+        
+        # update self variables that determine start and end of this rank's batch
+        self.counter = split_indices[rank]
+        self.max_events = split_indices[rank+1]
+        
     def get_images(self, num_images, assemble=True):
         """
         Retrieve a fixed number of images from the run. If the pedestal or gain 
         information is unavailable and unassembled images are requested, return
-        uncalibrated images.
+        uncalibrated images. 
         
-        Paramters
+        Parameters
         ---------
         num_images : int
-            number of images to retrieve
+            number of images to retrieve (per rank)
         assemble : bool, default=True
             whether to assemble panels into image
             
@@ -82,51 +171,40 @@ class PsanaInterface:
         images : numpy.ndarray, shape ((num_images,) + det_shape)
             images retrieved sequentially from run, optionally assembled
         """
-        counter = 0
-        calibrate = True
-
+        # set up storage array
         if assemble:
             images = np.zeros((num_images, 
                                self.det.image_xaxis(self.run).shape[0], 
                                self.det.image_yaxis(self.run).shape[0]))
         else:
             images = np.zeros((num_images,) + self.det.shape())
-        
-        for num,evt in enumerate(self.ds.events()):
-            if counter < num_images:
-                # check that pedestal and gain information are available
-                if counter == 0:
-                    if (self.det.pedestals(evt) is None) or (self.det.gain(evt) is None):
-                        calibrate = False
-                        if not calibrate and not assemble:
-                            print("Warning: calibration data unavailable, returning uncalibrated data")
-
-                # retrieve image, by default calibrated and assembled into detector format
+            
+        # retrieve next batch of images
+        for counter_batch in range(num_images):
+            if self.counter >= self.max_events:
+                images = images[:counter_batch]
+                print("No more events to retrieve")
+                break
+                
+            else:
+                evt = self.runner.event(self.times[self.counter])
                 if assemble:
-                    if not calibrate:
+                    if not self.calibrate:
                         raise IOError("Error: calibration data not found for this run.")
                     else:
-                        images[counter] = self.det.image(evt=evt)
+                        images[counter_batch] = self.det.image(evt=evt)
                 else:
-                    if calibrate:
-                        images[counter] = self.det.calib(evt=evt)
+                    if self.calibrate:
+                        images[counter_batch] = self.det.calib(evt=evt)
                     else:
-                        images[counter] = self.det.raw(evt=evt)
-
-                # optionally store timestamps associated with images
+                        images[counter_batch] = self.det.raw(evt=evt)
+                        
                 if self.track_timestamps:
                     self.get_timestamp(evt.get(EventId))
-
-            else:
-                break
-            counter += 1
-
-        if counter < num_images:
-            print("It appears we have reached the end of the run")
-            images = images[:counter]
-            
+                    
+                self.counter += 1
+             
         return images
-
 
 #### Miscellaneous functions ####
 
